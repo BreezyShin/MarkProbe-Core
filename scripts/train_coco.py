@@ -1,0 +1,219 @@
+"""Run quickstart notebook dataset preparation and training (9 epochs by default)."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import zipfile
+from pathlib import Path
+from typing import Optional
+
+import torch
+from tqdm import tqdm
+
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+from markprobe_core import train_model  # noqa: E402
+
+ZIP_PATH = Path("/public/data/image/COCO2014/train2014.zip")
+DATA_DIR = Path("/workspace/dataset/coco2014")
+OUTPUT = PROJECT / "runs/markprobe_core.pt"
+METRICS = PROJECT / "runs/markprobe_core.metrics.jsonl"
+CURVES = PROJECT / "runs/markprobe_core.curves.json"
+EPOCH_EXPORT_DIR = PROJECT / "runs/markprobe_core.epochs"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# Full-mode quickstart settings; only the epoch target is set to 9.
+IMAGE_SIZE = 400
+MESSAGE_BITS = 96
+WIDTH = 32
+EPOCHS = 9
+MAX_STEPS = None
+BATCH_SIZE = 4
+VAL_FRACTION = 0.1
+DUAL_BRANCH = True
+EPOCH_EXPORT_SAMPLES = 4
+ADAPTIVE_IMAGE_LOSS = False
+ADAPTIVE_MSG_THRESHOLD = 0.30
+ADAPTIVE_BER_THRESHOLD = 0.25
+ADAPTIVE_PATIENCE = 2
+ADAPTIVE_RAMP_STEPS = 15000
+VALIDATION_SAMPLES = 256
+NO_IM_LOSS_STEPS = 1500
+LOSS_RAMP_STEPS = 15000
+GEOMETRY_RAMP_STEPS = 10000
+JPEG_RAMP_STEPS = 1000
+EDGE_DELAY_STEPS = 80000
+EDGE_RAMP_STEPS = 10000
+YUV_SCALES = (1.0, 100.0, 100.0)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--zip", type=Path, default=ZIP_PATH, help="COCO train2014.zip path")
+    parser.add_argument("--data", type=Path, default=DATA_DIR, help="Extraction and training directory")
+    parser.add_argument("--output", type=Path, default=OUTPUT, help="Best checkpoint output path")
+    parser.add_argument("--metrics", type=Path, default=METRICS, help="JSONL metrics output path")
+    parser.add_argument("--curves", type=Path, default=CURVES,
+                        help="Column-oriented JSON curve data output path")
+    parser.add_argument("--epoch-export-dir", type=Path, default=EPOCH_EXPORT_DIR,
+                        help="Directory for per-epoch cover/encoded/decode artifacts")
+    parser.add_argument("--epoch-export-samples", type=int, default=EPOCH_EXPORT_SAMPLES,
+                        help="Validation samples exported after each epoch; 0 disables export")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Total target epochs (default: 9)")
+    max_steps = parser.add_mutually_exclusive_group()
+    max_steps.add_argument(
+        "--max-steps", type=int, default=MAX_STEPS,
+        help="Optional optimizer-step ceiling; omitted by default so all epochs run",
+    )
+    max_steps.add_argument(
+        "--no-max-steps", action="store_true",
+        help="Disable the optimizer-step ceiling and complete all requested epochs",
+    )
+    parser.add_argument("--device", default=None, help="cuda:0, cpu; defaults to CUDA when available")
+    parser.add_argument("--limit", type=int, default=None, help="Optional image cap for smoke tests")
+    parser.add_argument("--resume", type=Path, default=None, help="Explicit .last.pt training checkpoint")
+    parser.add_argument("--no-resume", action="store_true", help="Start fresh even if .last.pt exists")
+    return parser.parse_args()
+
+
+def prepare_data(zip_path: Path, data_dir: Path):
+    marker = data_dir / ".train2014_extracted"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Dataset archive: {zip_path}")
+    print(f"Dataset extraction/training directory: {data_dir.resolve()}")
+    if not marker.is_file():
+        if not zip_path.is_file():
+            raise FileNotFoundError(f"COCO archive not found: {zip_path}; pass --zip")
+        print("Stage 1/2: extracting train2014.zip")
+        with zipfile.ZipFile(zip_path) as archive:
+            files = [entry for entry in archive.infolist() if not entry.is_dir()]
+            with tqdm(files, desc="Extract train2014.zip", unit="file", mininterval=1.0) as bar:
+                for entry in bar:
+                    archive.extract(entry, data_dir)
+        marker.touch()
+        print(f"Extraction complete: {len(files):,} files")
+    else:
+        print(f"Extraction marker found; reusing {data_dir.resolve()}")
+
+    images = sorted(p for p in data_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    if not images:
+        raise RuntimeError(f"No supported images found under {data_dir.resolve()}")
+    val_count = max(1, int(len(images) * VAL_FRACTION)) if len(images) > 1 else 0
+    print("Dataset loaded successfully")
+    print(f"  Resolved path: {data_dir.resolve()}")
+    print(f"  Total images: {len(images):,}")
+    print(f"  Training images: {len(images) - val_count:,} | Validation images: {val_count:,}")
+    return images
+
+
+def expected_train_config():
+    return {
+        "batch_size": BATCH_SIZE, "lr": 1e-4, "seed": 2026,
+        "val_fraction": VAL_FRACTION, "no_im_loss_steps": NO_IM_LOSS_STEPS,
+        "l2_loss_scale": 2.0, "l2_loss_ramp_steps": LOSS_RAMP_STEPS,
+        "lpips_loss_ramp_steps": LOSS_RAMP_STEPS,
+        "geometry_ramp_steps": GEOMETRY_RAMP_STEPS,
+        "jpeg_ramp_steps": JPEG_RAMP_STEPS, "lpips_weight": 1.5,
+        "secret_loss_scale": 1.5, "secret_loss_ramp_steps": 1,
+        "yuv_scales": YUV_SCALES, "edge_gain": 10.0,
+        "edge_delay_steps": EDGE_DELAY_STEPS, "edge_ramp_steps": EDGE_RAMP_STEPS,
+        "gan_weight": 0.5, "gan_ramp_steps": LOSS_RAMP_STEPS,
+        "use_gan": True, "use_jpeg": True, "border": "white",
+        "dual_branch": DUAL_BRANCH, "crop_scale_min": 0.65,
+        "crop_scale_max": 0.90, "adaptive_image_loss": ADAPTIVE_IMAGE_LOSS,
+        "adaptive_msg_threshold": ADAPTIVE_MSG_THRESHOLD,
+        "adaptive_ber_threshold": ADAPTIVE_BER_THRESHOLD,
+        "adaptive_patience": ADAPTIVE_PATIENCE,
+        "adaptive_ramp_steps": ADAPTIVE_RAMP_STEPS,
+        "validation_samples": VALIDATION_SAMPLES,
+    }
+
+
+def select_resume(output: Path, explicit: Optional[Path], no_resume: bool):
+    if no_resume:
+        print("Resume checkpoint: disabled")
+        return None
+    checkpoint = explicit or output.with_name(output.stem + ".last" + output.suffix)
+    if not checkpoint.is_file():
+        print(f"Resume checkpoint: none found at {checkpoint}")
+        return None
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    arch = (MESSAGE_BITS, WIDTH, True, 0.1, IMAGE_SIZE)
+    saved_arch = (state.get("message_bits"), state.get("width"), state.get("use_stn"),
+                  state.get("residual_scale"), state.get("image_size"))
+    saved_config = state.get("training_state", {}).get("train_config", {})
+    if state.get("format") != "markprobe-core-v6-robust-training":
+        reason = "checkpoint format is not resumable"
+    elif saved_arch != arch:
+        reason = f"architecture mismatch: expected {arch}, found {saved_arch}"
+    elif saved_config != expected_train_config():
+        reason = "saved training settings differ from this script"
+    else:
+        print(f"Compatible resume checkpoint: {checkpoint.resolve()}")
+        return checkpoint
+    if explicit:
+        raise ValueError(f"Cannot resume {checkpoint}: {reason}. Use matching settings or --no-resume.")
+    print(f"Found checkpoint but {reason}; starting a fresh run (checkpoint is left untouched).")
+    return None
+
+
+def main():
+    args = parse_args()
+    max_steps = None if args.no_max_steps else args.max_steps
+    if max_steps is not None and max_steps < 1:
+        raise ValueError("--max-steps must be positive; use --no-max-steps to disable it")
+    images = prepare_data(args.zip, args.data)
+    print(f"Training image limit: {args.limit:,}" if args.limit else "Training image limit: all images")
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"Requested {device}, but CUDA is unavailable")
+    if device.type == "cuda":
+        print(f"GPU training device: {torch.cuda.get_device_name(device)} ({device})")
+    else:
+        print(f"Training device: {device} (full COCO training will be slow)")
+
+    resume = select_resume(args.output, args.resume, args.no_resume)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.metrics.parent.mkdir(parents=True, exist_ok=True)
+    print("Stage 2/2: training MarkProbe-Core")
+    print(f"Training config: image_size={IMAGE_SIZE}, width={WIDTH}, message_bits={MESSAGE_BITS}, "
+          f"STN=True, dual_branch={DUAL_BRANCH}, epochs={args.epochs}, "
+          f"max_steps={max_steps}, batch_size={BATCH_SIZE}")
+    print(f"Best checkpoint: {args.output.resolve()}")
+    print(f"Metrics log: {args.metrics.resolve()}")
+    print(f"Curve data: {args.curves.resolve()}")
+    print(f"Epoch inference artifacts: {args.epoch_export_dir.resolve()} (samples={args.epoch_export_samples})")
+
+    train_model(
+        args.data, args.output, image_size=IMAGE_SIZE, message_bits=MESSAGE_BITS,
+        width=WIDTH, epochs=args.epochs, max_steps=max_steps, batch_size=BATCH_SIZE,
+        limit=args.limit, val_fraction=VAL_FRACTION, device=device, resume=resume,
+        use_stn=True, residual_scale=0.1, no_im_loss_steps=NO_IM_LOSS_STEPS,
+        image_weight=2.0, l2_loss_ramp_steps=LOSS_RAMP_STEPS,
+        lpips_loss_ramp_steps=LOSS_RAMP_STEPS,
+        geometry_ramp_steps=GEOMETRY_RAMP_STEPS, jpeg_ramp_steps=JPEG_RAMP_STEPS,
+        edge_delay_steps=EDGE_DELAY_STEPS, edge_ramp_steps=EDGE_RAMP_STEPS,
+        lpips_weight=1.5, yuv_scales=YUV_SCALES,
+        secret_loss_scale=1.5, secret_loss_ramp_steps=1,
+        gan_weight=0.5, gan_ramp_steps=LOSS_RAMP_STEPS, use_gan=True,
+        use_jpeg=True, border="white", dual_branch=DUAL_BRANCH,
+        crop_scale_min=0.65, crop_scale_max=0.90,
+        adaptive_image_loss=ADAPTIVE_IMAGE_LOSS,
+        adaptive_msg_threshold=ADAPTIVE_MSG_THRESHOLD,
+        adaptive_ber_threshold=ADAPTIVE_BER_THRESHOLD,
+        adaptive_patience=ADAPTIVE_PATIENCE, adaptive_ramp_steps=ADAPTIVE_RAMP_STEPS,
+        validation_samples=VALIDATION_SAMPLES, gradient_log_interval=100,
+        metrics_path=args.metrics, curves_path=args.curves,
+        epoch_export_dir=args.epoch_export_dir,
+        epoch_export_samples=args.epoch_export_samples,
+    )
+    latest = args.output.with_name(args.output.stem + ".last" + args.output.suffix)
+    print(f"Training complete; best checkpoint: {args.output.resolve()}")
+    print(f"Latest resumable checkpoint: {latest.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
