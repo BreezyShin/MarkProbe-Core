@@ -1,4 +1,4 @@
-"""Run quickstart notebook dataset preparation and training (9 epochs by default)."""
+"""Prepare an image dataset and train MarkProbe (9 epochs by default)."""
 
 from __future__ import annotations
 
@@ -15,8 +15,9 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 from markprobe_core import train_model  # noqa: E402
 
-ZIP_PATH = Path("/public/data/image/COCO2014/train2014.zip")
-DATA_DIR = Path("/workspace/dataset/coco2014")
+# COCO is the default dataset only; pass --data/--zip for another dataset.
+DEFAULT_ARCHIVE = Path("/public/data/image/COCO2014/train2014.zip")
+DEFAULT_DATA_DIR = Path("/workspace/dataset/coco2014")
 OUTPUT = PROJECT / "runs/markprobe_core.pt"
 METRICS = PROJECT / "runs/markprobe_core.metrics.jsonl"
 CURVES = PROJECT / "runs/markprobe_core.curves.json"
@@ -52,8 +53,10 @@ YUV_SCALES = (1.0, 100.0, 100.0)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--zip", type=Path, default=ZIP_PATH, help="COCO train2014.zip path")
-    parser.add_argument("--data", type=Path, default=DATA_DIR, help="Extraction and training directory")
+    parser.add_argument("--zip", type=Path, default=DEFAULT_ARCHIVE,
+                        help="Optional archive to extract when --data has no images")
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR,
+                        help="Image directory or archive extraction/training directory")
     parser.add_argument("--output", type=Path, default=OUTPUT, help="Best checkpoint output path")
     parser.add_argument("--metrics", type=Path, default=METRICS, help="JSONL metrics output path")
     parser.add_argument("--curves", type=Path, default=CURVES,
@@ -87,27 +90,33 @@ def parse_args():
     return parser.parse_args()
 
 
-def prepare_data(zip_path: Path, data_dir: Path):
-    marker = data_dir / ".train2014_extracted"
+def prepare_data(zip_path: Path | None, data_dir: Path):
+    marker = data_dir / ".dataset_archive_extracted"
+    legacy_marker = data_dir / ".train2014_extracted"
     data_dir.mkdir(parents=True, exist_ok=True)
     print(f"Dataset archive: {zip_path}")
     print(f"Dataset extraction/training directory: {data_dir.resolve()}")
-    if not marker.is_file():
-        if not zip_path.is_file():
-            raise FileNotFoundError(f"COCO archive not found: {zip_path}; pass --zip")
-        print("Stage 1/2: extracting train2014.zip")
+    images = sorted(p for p in data_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    if not images and not marker.is_file() and not legacy_marker.is_file():
+        if zip_path is None or not zip_path.is_file():
+            raise FileNotFoundError(
+                f"No images found under {data_dir.resolve()}; provide an image directory "
+                "or an archive with --zip."
+            )
+        print(f"Dataset archive found: {zip_path.resolve()}")
+        print("Dataset extraction: starting")
         with zipfile.ZipFile(zip_path) as archive:
             files = [entry for entry in archive.infolist() if not entry.is_dir()]
-            with tqdm(files, desc="Extract train2014.zip", unit="file", mininterval=1.0) as bar:
+            with tqdm(files, desc="Extract dataset archive", unit="file", mininterval=1.0) as bar:
                 for entry in bar:
                     archive.extract(entry, data_dir)
         marker.touch()
         print(f"Extraction complete: {len(files):,} files")
-    else:
+        images = sorted(p for p in data_dir.rglob("*")
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    elif marker.is_file() or legacy_marker.is_file():
         print(f"Extraction marker found; reusing {data_dir.resolve()}")
-
-    images = sorted(p for p in data_dir.rglob("*")
-                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
     if not images:
         raise RuntimeError(f"No supported images found under {data_dir.resolve()}")
     val_count = max(1, int(len(images) * VAL_FRACTION)) if len(images) > 1 else 0
@@ -228,7 +237,7 @@ def main():
     if device.type == "cuda":
         print(f"GPU training device: {torch.cuda.get_device_name(device)} ({device})")
     else:
-        print(f"Training device: {device} (full COCO training will be slow)")
+        print(f"Training device: {device} (full-dataset training will be slow)")
 
     if args.no_resume and args.finetune_from is not None:
         raise ValueError("--no-resume cannot be combined with --finetune-from")

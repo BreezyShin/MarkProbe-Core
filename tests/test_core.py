@@ -14,7 +14,7 @@ from markprobe_core.finetune import merge_finetune_settings
 from markprobe_core.engine import (_StegaStampDiscriminator, _warp_projective, jpeg_compress_decompress, quantize_8bit_ste,
                                    _reference_geometry_embed, crop_resize_attack, stegastamp_transform,
                                    _stegastamp_yuv_loss, _edge_falloff, _rgb_yuv, _linear_ramp)
-from scripts.train_coco import expected_train_config, training_config_from_checkpoint
+from scripts.train import expected_train_config, prepare_data, training_config_from_checkpoint
 
 
 class CoreTests(unittest.TestCase):
@@ -38,6 +38,14 @@ class CoreTests(unittest.TestCase):
         config = training_config_from_checkpoint(None, 0.80, 0.95)
         self.assertEqual(config["crop_scale_min"], 0.80)
         self.assertEqual(config["crop_scale_max"], 0.95)
+
+    def test_training_accepts_prepared_non_coco_image_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder) / "images"
+            data_dir.mkdir()
+            Image.new("RGB", (8, 8), color=(10, 20, 30)).save(data_dir / "sample.png")
+            images = prepare_data(Path(folder) / "missing.zip", data_dir)
+            self.assertEqual(images, [data_dir / "sample.png"])
 
     def test_text_payload(self):
         text = "hello"
