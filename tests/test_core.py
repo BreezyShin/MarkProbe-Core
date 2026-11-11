@@ -9,7 +9,8 @@ from PIL import Image
 
 from markprobe_core import (MarkProbe, bits_to_text, decode_image, encode_image,
                             load_checkpoint, save_checkpoint, text_to_bits,
-                            train_model)
+                            train_model, run_finetune)
+from markprobe_core.finetune import merge_finetune_settings
 from markprobe_core.engine import (_StegaStampDiscriminator, _warp_projective, jpeg_compress_decompress, quantize_8bit_ste,
                                    _reference_geometry_embed, crop_resize_attack, stegastamp_transform,
                                    _stegastamp_yuv_loss, _edge_falloff, _rgb_yuv, _linear_ramp)
@@ -291,17 +292,26 @@ class CoreTests(unittest.TestCase):
             )
             source = root / "base.last.pt"
             finetuned = root / "finetuned.pt"
-            train_model(
-                data_dir, finetuned, image_size=16, message_bits=8, width=32,
-                epochs=1, batch_size=2, val_fraction=0.25, device="cpu",
-                workers=0, progress=False, seed=11, lpips_weight=0.0, use_gan=False,
-                no_im_loss_steps=0, crop_scale_min=0.80, crop_scale_max=0.95,
-                finetune_from=source,
+            run_finetune(
+                data_dir, source, finetuned, device="cpu",
+                settings={
+                    "epochs": 1, "batch_size": 2, "val_fraction": 0.25,
+                    "seed": 11, "lpips_weight": 0.0, "use_gan": False,
+                    "no_im_loss_steps": 0, "crop_scale_min": 0.80,
+                    "crop_scale_max": 0.95, "progress": False,
+                },
             )
             state = torch.load(root / "finetuned.last.pt", map_location="cpu", weights_only=False)
             self.assertEqual(state["epoch"], 1)
             self.assertEqual(state["global_step"], 2)
             self.assertEqual(state["training_state"]["train_config"]["crop_scale_min"], 0.80)
+
+    def test_finetune_settings_reject_architecture_overrides(self):
+        settings = merge_finetune_settings({"lr": 2e-5, "crop_scale_min": 0.75})
+        self.assertEqual(settings["lr"], 2e-5)
+        self.assertEqual(settings["crop_scale_min"], 0.75)
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            merge_finetune_settings({"image_size": 256})
 
     def test_crop_resize_attack_preserves_shape_and_gradients(self):
         image = torch.rand(2, 3, 24, 24, requires_grad=True)

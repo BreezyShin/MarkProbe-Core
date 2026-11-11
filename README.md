@@ -38,6 +38,18 @@ python -m markprobe_core.cli train --data /path/to/images \
 
 The architecture must still match (`message_bits`, width, image size, STN, and residual scale). Keep the original checkpoint as a baseline; the fine-tuned run starts its log at epoch 1 even though its initial weights came from a later checkpoint.
 
+For a separate fine-tuning workflow, use `scripts/finetune_coco.py` with the already extracted dataset. It calls the same reusable `run_finetune` API as `notebooks/finetune.ipynb`, which delegates training to `train_model`; no second training loop is maintained. A JSON config can override any supported `train_model` setting, so new loss/schedule parameters can be added in one place and exposed to both interfaces:
+
+```bash
+python scripts/finetune_coco.py \
+  --checkpoint runs/markprobe_core.last.pt \
+  --data /workspace/dataset/coco2014 \
+  --output runs/markprobe_core_finetune.pt \
+  --epochs 10 --lr 1e-5 --crop-scale-min 0.80 --crop-scale-max 0.95
+```
+
+See `notebooks/finetune.ipynb` to edit the same settings interactively. Fine-tuning defaults use a lower learning rate and short loss ramps; adjust them based on validation BER and clean-image quality rather than assuming the defaults improve every checkpoint. Both interfaces preserve the source checkpoint and save fresh metrics, curve data, and per-epoch image/residual exports next to the new output.
+
 The `notebooks/quickstart.ipynb` notebook extracts the configured COCO `train2014.zip`, trains, displays progress, and evaluates PNG plus JPEG quality-75 inference. Adjust dataset paths for your Linux machine. Full mode uses all data, 96 message bits, batch 4, and a 140,000-step target. Its default training objective follows `StegaStamp/scripts/base.sh`: one message branch, secret-only warm-up, then fixed step-based ramps for YUV, LPIPS, GAN, and perspective strength. A 10% held-out split is used for diagnostics and checkpoint selection, not to gate training losses. `FAST_SMOKE_TEST=True` uses a short schedule and 512-image limit; its metrics are not quality training. The original repo's default data path points at MIRFLICKR; this notebook uses COCO2014, so the image distribution differs.
 
 Run the equivalent dataset-preparation and training stages without Jupyter using `python scripts/train_coco.py`. It uses the notebook's full-mode settings (including a 140,000-step ceiling) with a 9-epoch target and automatically resumes a compatible `.last.pt` checkpoint. Override paths with `--zip`, `--data`, `--output`, and `--metrics`; use `--no-resume` to start fresh. To run all 9 complete epochs without the notebook's step ceiling, pass `--no-max-steps`.
