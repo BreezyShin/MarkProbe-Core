@@ -14,9 +14,31 @@ from markprobe_core.finetune import merge_finetune_settings
 from markprobe_core.engine import (_StegaStampDiscriminator, _warp_projective, jpeg_compress_decompress, quantize_8bit_ste,
                                    _reference_geometry_embed, crop_resize_attack, stegastamp_transform,
                                    _stegastamp_yuv_loss, _edge_falloff, _rgb_yuv, _linear_ramp)
+from scripts.train_coco import expected_train_config, training_config_from_checkpoint
 
 
 class CoreTests(unittest.TestCase):
+    def test_coco_resume_reuses_saved_training_config(self):
+        saved = expected_train_config(0.80, 0.95)
+        config = training_config_from_checkpoint(saved)
+        self.assertEqual(config["crop_scale_min"], 0.80)
+        self.assertEqual(config["crop_scale_max"], 0.95)
+        self.assertEqual(config["dual_branch"], saved["dual_branch"])
+        self.assertEqual(config["yuv_scales"], tuple(saved["yuv_scales"]))
+
+    def test_coco_resume_rejects_crop_override_and_incomplete_config(self):
+        saved = expected_train_config(0.80, 0.95)
+        with self.assertRaisesRegex(ValueError, "differs from the resumed checkpoint"):
+            training_config_from_checkpoint(saved, crop_scale_min=0.75)
+        saved.pop("dual_branch")
+        with self.assertRaisesRegex(ValueError, "incomplete training configuration"):
+            training_config_from_checkpoint(saved)
+
+    def test_coco_fresh_run_accepts_crop_settings(self):
+        config = training_config_from_checkpoint(None, 0.80, 0.95)
+        self.assertEqual(config["crop_scale_min"], 0.80)
+        self.assertEqual(config["crop_scale_max"], 0.95)
+
     def test_text_payload(self):
         text = "hello"
         self.assertEqual(bits_to_text(text_to_bits(text, 96)), text)

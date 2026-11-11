@@ -74,9 +74,9 @@ def parse_args():
     )
     parser.add_argument("--device", default=None, help="cuda:0, cpu; defaults to CUDA when available")
     parser.add_argument("--limit", type=int, default=None, help="Optional image cap for smoke tests")
-    parser.add_argument("--crop-scale-min", type=float, default=CROP_SCALE_MIN,
+    parser.add_argument("--crop-scale-min", type=float, default=None,
                         help="Minimum retained side fraction for the crop branch")
-    parser.add_argument("--crop-scale-max", type=float, default=CROP_SCALE_MAX,
+    parser.add_argument("--crop-scale-max", type=float, default=None,
                         help="Maximum retained side fraction for the crop branch")
     checkpoint_group = parser.add_mutually_exclusive_group()
     checkpoint_group.add_argument("--resume", type=Path, default=None,
@@ -141,14 +141,14 @@ def expected_train_config(crop_scale_min=CROP_SCALE_MIN, crop_scale_max=CROP_SCA
     }
 
 
-def select_resume(output: Path, explicit: Optional[Path], no_resume: bool, expected_config=None):
+def select_resume(output: Path, explicit: Optional[Path], no_resume: bool):
     if no_resume:
         print("Resume checkpoint: disabled")
-        return None
+        return None, None
     checkpoint = explicit or output.with_name(output.stem + ".last" + output.suffix)
     if not checkpoint.is_file():
         print(f"Resume checkpoint: none found at {checkpoint}")
-        return None
+        return None, None
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     arch = (MESSAGE_BITS, WIDTH, True, 0.1, IMAGE_SIZE)
     saved_arch = (state.get("message_bits"), state.get("width"), state.get("use_stn"),
@@ -158,15 +158,43 @@ def select_resume(output: Path, explicit: Optional[Path], no_resume: bool, expec
         reason = "checkpoint format is not resumable"
     elif saved_arch != arch:
         reason = f"architecture mismatch: expected {arch}, found {saved_arch}"
-    elif saved_config != (expected_config or expected_train_config()):
-        reason = "saved training settings differ from this script"
+    elif not saved_config:
+        reason = "checkpoint has no saved training configuration"
     else:
         print(f"Compatible resume checkpoint: {checkpoint.resolve()}")
-        return checkpoint
+        print("Reusing saved training configuration from checkpoint")
+        return checkpoint, saved_config
     if explicit:
         raise ValueError(f"Cannot resume {checkpoint}: {reason}. Use matching settings or --no-resume.")
     print(f"Found checkpoint but {reason}; starting a fresh run (checkpoint is left untouched).")
-    return None
+    return None, None
+
+
+def training_config_from_checkpoint(saved_config, crop_scale_min=None, crop_scale_max=None):
+    """Reuse checkpoint settings, rejecting explicit crop changes during resume."""
+    config = expected_train_config()
+    if saved_config is not None:
+        missing = sorted(set(config) - set(saved_config))
+        if missing:
+            raise ValueError(
+                "Resume checkpoint has an incomplete training configuration; missing: {}. "
+                "Use --finetune-from to load its weights with a new configuration."
+                .format(", ".join(missing))
+            )
+        config.update(saved_config)
+    for name, requested in (("crop_scale_min", crop_scale_min),
+                            ("crop_scale_max", crop_scale_max)):
+        if requested is not None and saved_config is not None and requested != config[name]:
+            raise ValueError(
+                "--{}={} differs from the resumed checkpoint value {}. "
+                "Resume must keep its saved configuration; use --finetune-from "
+                "to intentionally change training settings."
+                .format(name.replace("_", "-"), requested, config[name])
+            )
+        if requested is not None and saved_config is None:
+            config[name] = requested
+    config["yuv_scales"] = tuple(config["yuv_scales"])
+    return config
 
 
 def select_finetune(checkpoint: Optional[Path]):
@@ -204,9 +232,15 @@ def main():
 
     if args.no_resume and args.finetune_from is not None:
         raise ValueError("--no-resume cannot be combined with --finetune-from")
-    resume = select_resume(args.output, args.resume,
-                           args.no_resume or args.finetune_from is not None,
-                           expected_train_config(args.crop_scale_min, args.crop_scale_max))
+    resume, saved_config = select_resume(
+        args.output, args.resume,
+        args.no_resume or args.finetune_from is not None,
+    )
+    training_config = training_config_from_checkpoint(
+        saved_config if resume is not None else None,
+        args.crop_scale_min,
+        args.crop_scale_max,
+    )
     finetune_from = select_finetune(args.finetune_from)
     if finetune_from is not None:
         source = finetune_from.resolve()
@@ -221,33 +255,50 @@ def main():
     args.metrics.parent.mkdir(parents=True, exist_ok=True)
     print("Stage 2/2: training MarkProbe-Core")
     print(f"Training config: image_size={IMAGE_SIZE}, width={WIDTH}, message_bits={MESSAGE_BITS}, "
-        f"STN=True, dual_branch={DUAL_BRANCH}, crop={args.crop_scale_min:.2f}-{args.crop_scale_max:.2f}, epochs={args.epochs}, "
-          f"max_steps={max_steps}, batch_size={BATCH_SIZE}")
+        f"STN=True, dual_branch={training_config['dual_branch']}, "
+        f"crop={training_config['crop_scale_min']:.2f}-{training_config['crop_scale_max']:.2f}, epochs={args.epochs}, "
+          f"max_steps={max_steps}, batch_size={training_config['batch_size']}")
     print(f"Best checkpoint: {args.output.resolve()}")
     print(f"Metrics log: {args.metrics.resolve()}")
     print(f"Curve data: {args.curves.resolve()}")
     print(f"Epoch inference artifacts: {args.epoch_export_dir.resolve()} (samples={args.epoch_export_samples})")
 
     train_model(
-        args.data, args.output, image_size=IMAGE_SIZE, message_bits=MESSAGE_BITS,
-        width=WIDTH, epochs=args.epochs, max_steps=max_steps, batch_size=BATCH_SIZE,
-        limit=args.limit, val_fraction=VAL_FRACTION, device=device, resume=resume,
+        args.data, args.output, epochs=args.epochs, max_steps=max_steps,
+        limit=args.limit, device=device, resume=resume,
         finetune_from=finetune_from,
-        use_stn=True, residual_scale=0.1, no_im_loss_steps=NO_IM_LOSS_STEPS,
-        image_weight=2.0, l2_loss_ramp_steps=LOSS_RAMP_STEPS,
-        lpips_loss_ramp_steps=LOSS_RAMP_STEPS,
-        geometry_ramp_steps=GEOMETRY_RAMP_STEPS, jpeg_ramp_steps=JPEG_RAMP_STEPS,
-        edge_delay_steps=EDGE_DELAY_STEPS, edge_ramp_steps=EDGE_RAMP_STEPS,
-        lpips_weight=1.5, yuv_scales=YUV_SCALES,
-        secret_loss_scale=1.5, secret_loss_ramp_steps=1,
-        gan_weight=0.5, gan_ramp_steps=LOSS_RAMP_STEPS, use_gan=True,
-        use_jpeg=True, border="white", dual_branch=DUAL_BRANCH,
-        crop_scale_min=args.crop_scale_min, crop_scale_max=args.crop_scale_max,
-        adaptive_image_loss=ADAPTIVE_IMAGE_LOSS,
-        adaptive_msg_threshold=ADAPTIVE_MSG_THRESHOLD,
-        adaptive_ber_threshold=ADAPTIVE_BER_THRESHOLD,
-        adaptive_patience=ADAPTIVE_PATIENCE, adaptive_ramp_steps=ADAPTIVE_RAMP_STEPS,
-        validation_samples=VALIDATION_SAMPLES, gradient_log_interval=100,
+        image_size=IMAGE_SIZE, message_bits=MESSAGE_BITS, width=WIDTH,
+        use_stn=True, residual_scale=0.1,
+        batch_size=training_config["batch_size"],
+        lr=training_config["lr"], seed=training_config["seed"],
+        val_fraction=training_config["val_fraction"],
+        no_im_loss_steps=training_config["no_im_loss_steps"],
+        image_weight=training_config["l2_loss_scale"],
+        l2_loss_ramp_steps=training_config["l2_loss_ramp_steps"],
+        lpips_loss_ramp_steps=training_config["lpips_loss_ramp_steps"],
+        geometry_ramp_steps=training_config["geometry_ramp_steps"],
+        jpeg_ramp_steps=training_config["jpeg_ramp_steps"],
+        edge_gain=training_config["edge_gain"],
+        edge_delay_steps=training_config["edge_delay_steps"],
+        edge_ramp_steps=training_config["edge_ramp_steps"],
+        lpips_weight=training_config["lpips_weight"],
+        yuv_scales=training_config["yuv_scales"],
+        secret_loss_scale=training_config["secret_loss_scale"],
+        secret_loss_ramp_steps=training_config["secret_loss_ramp_steps"],
+        gan_weight=training_config["gan_weight"],
+        gan_ramp_steps=training_config["gan_ramp_steps"],
+        use_gan=training_config["use_gan"],
+        use_jpeg=training_config["use_jpeg"],
+        border=training_config["border"],
+        dual_branch=training_config["dual_branch"],
+        crop_scale_min=training_config["crop_scale_min"],
+        crop_scale_max=training_config["crop_scale_max"],
+        adaptive_image_loss=training_config["adaptive_image_loss"],
+        adaptive_msg_threshold=training_config["adaptive_msg_threshold"],
+        adaptive_ber_threshold=training_config["adaptive_ber_threshold"],
+        adaptive_patience=training_config["adaptive_patience"],
+        adaptive_ramp_steps=training_config["adaptive_ramp_steps"],
+        validation_samples=training_config["validation_samples"], gradient_log_interval=100,
         metrics_path=args.metrics, curves_path=args.curves,
         epoch_export_dir=args.epoch_export_dir,
         epoch_export_samples=args.epoch_export_samples,

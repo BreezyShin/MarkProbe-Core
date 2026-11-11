@@ -18,6 +18,12 @@ Put RGB/JPEG/PNG images under a directory (nested directories are searched). Ima
 python -m markprobe_core.cli train --data /path/to/images --output runs/markprobe.pt --epochs 20 --image-size 400 --batch-size 4
 ```
 
+For the COCO workflow, `scripts/train_coco.py` automatically reuses the complete training configuration stored in a compatible `.last.pt` checkpoint, including `dual_branch` and the crop range. You only need to specify the new total epoch target (and optionally disable the step ceiling); do not pass crop values unless you are confirming they match the checkpoint. To intentionally change training settings, use the separate fine-tuning workflow instead.
+
+```bash
+python scripts/train_coco.py --resume runs/markprobe_core.last.pt --epochs 30 --no-max-steps
+```
+
 With validation enabled, training writes the best validation checkpoint to the requested output path and the latest resumable state beside it with `.last` before the extension. With `--val-fraction 0`, it writes the latest checkpoint to both paths. The reference-aligned defaults follow `StegaStamp/scripts/base.sh`: a 1,500-step secret-only warm-up; 10,000-step perspective ramp; 15,000-step YUV/LPIPS/adversarial ramps; weighted YUV `(1, 100, 100)`; loss weights `secret=1.5`, `YUV=2`, `LPIPS=1.5`, `GAN=0.5`; JPEG quality 50; and a delayed/ramped edge penalty. Each reference-style epoch performs `floor(N / batch_size) + 1` full batches sampled with replacement. `--epochs` is the total target epoch count, so a run stopped after epoch 5 can be continued to epoch 20 with:
 
 ```bash
