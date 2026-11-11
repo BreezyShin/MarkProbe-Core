@@ -27,6 +27,17 @@ python -m markprobe_core.cli train --data /path/to/images \
 
 The resumable checkpoint includes model weights, architecture metadata, both generator Adam states, the training-only discriminator and RMSProp state, global step, best validation loss, and Python/NumPy/PyTorch RNG states. Keep architecture and training objectives unchanged when resuming. Validation reports clean-PNG and transformed-image bit accuracy. Training uses the reference cover-warp/embed/unwarp geometry, reference border modes, and camera transform (blur/noise/brightness/hue/contrast/saturation/differentiable JPEG). TensorFlow's sampler/convolution kernels are ported to PyTorch equivalents, so floating-point outputs are not bit-identical.
 
+When changing the crop range, loss weights, ramps, edge penalty, or other training settings after a completed run, use weight-only fine-tuning instead of `--resume`. It loads the model at the selected checkpoint, resets optimizer/discriminator state and step-based ramps, and writes to a new output path:
+
+```bash
+python -m markprobe_core.cli train --data /path/to/images \
+  --output runs/markprobe_finetune.pt --epochs 10 \
+  --finetune-from runs/markprobe.last.pt \
+  --crop-scale-min 0.80 --crop-scale-max 0.95
+```
+
+The architecture must still match (`message_bits`, width, image size, STN, and residual scale). Keep the original checkpoint as a baseline; the fine-tuned run starts its log at epoch 1 even though its initial weights came from a later checkpoint.
+
 The `notebooks/quickstart.ipynb` notebook extracts the configured COCO `train2014.zip`, trains, displays progress, and evaluates PNG plus JPEG quality-75 inference. Adjust dataset paths for your Linux machine. Full mode uses all data, 96 message bits, batch 4, and a 140,000-step target. Its default training objective follows `StegaStamp/scripts/base.sh`: one message branch, secret-only warm-up, then fixed step-based ramps for YUV, LPIPS, GAN, and perspective strength. A 10% held-out split is used for diagnostics and checkpoint selection, not to gate training losses. `FAST_SMOKE_TEST=True` uses a short schedule and 512-image limit; its metrics are not quality training. The original repo's default data path points at MIRFLICKR; this notebook uses COCO2014, so the image distribution differs.
 
 Run the equivalent dataset-preparation and training stages without Jupyter using `python scripts/train_coco.py`. It uses the notebook's full-mode settings (including a 140,000-step ceiling) with a 9-epoch target and automatically resumes a compatible `.last.pt` checkpoint. Override paths with `--zip`, `--data`, `--output`, and `--metrics`; use `--no-resume` to start fresh. To run all 9 complete epochs without the notebook's step ceiling, pass `--no-max-steps`.

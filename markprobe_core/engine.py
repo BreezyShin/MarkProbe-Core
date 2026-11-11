@@ -671,7 +671,8 @@ def train_model(data_dir, output, image_size=400, message_bits=96, width=32,
                 epochs=10, batch_size=4, lr=1e-4, image_weight=1.5,
                 val_fraction=0.1, workers=0, seed=2026, device=None, limit=None,
                 max_steps=None,
-                progress=True, progress_interval=5.0, resume=None, use_stn=True,
+                progress=True, progress_interval=5.0, resume=None, finetune_from=None,
+                use_stn=True,
                 residual_scale=0.1, no_im_loss_steps=1500,
                 l2_loss_ramp_steps=15000, lpips_loss_ramp_steps=15000,
                 geometry_ramp_steps=10000, jpeg_ramp_steps=1000,
@@ -694,6 +695,8 @@ def train_model(data_dir, output, image_size=400, message_bits=96, width=32,
     Numeric metrics are also exported as column-oriented JSON/CSV curves, and a
     small deterministic inference set is saved after every completed epoch.
     """
+    if resume is not None and finetune_from is not None:
+        raise ValueError("resume and finetune_from are mutually exclusive")
     l2_loss_scale = float(image_weight) if image_weight is not None else 2.0
     if not (0.0 <= val_fraction < 1.0):
         raise ValueError("val_fraction must be in [0, 1)")
@@ -754,8 +757,9 @@ def train_model(data_dir, output, image_size=400, message_bits=96, width=32,
     perceptual = _make_lpips(device) if lpips_weight > 0 else None
     start_epoch, global_step, best = 0, 0, float("inf")
     adaptive_ready_epochs, adaptive_start_step = 0, None
-    if resume:
-        state = _read_checkpoint(resume, device)
+    checkpoint = resume if resume is not None else finetune_from
+    if checkpoint:
+        state = _read_checkpoint(checkpoint, device)
         if state.get("format") != CHECKPOINT_FORMAT:
             raise ValueError("This checkpoint has weights but not compatible v6 training state; start a new run or use it for inference.")
         expected = (message_bits, width, bool(use_stn), float(residual_scale), int(image_size))
@@ -770,21 +774,24 @@ def train_model(data_dir, output, image_size=400, message_bits=96, width=32,
                 .format(expected, found, state["message_bits"])
             )
         model.load_state_dict(state["model"])
-        train_state = state.get("training_state", {})
-        if train_state.get("secret_optimizer"):
-            secret_optimizer.load_state_dict(train_state["secret_optimizer"])
-        if train_state.get("full_optimizer"):
-            full_optimizer.load_state_dict(train_state["full_optimizer"])
-        if use_gan and train_state.get("discriminator"):
-            discriminator.load_state_dict(train_state["discriminator"])
-            discriminator_optimizer.load_state_dict(train_state["discriminator_optimizer"])
-        adaptive_ready_epochs = int(train_state.get("adaptive_ready_epochs", 0))
-        adaptive_start_step = train_state.get("adaptive_start_step")
-        start_epoch = int(state.get("epoch", 0))
-        global_step = int(state.get("global_step", 0))
-        best = float(state.get("best_val_loss", best))
-        _restore_rng_state(state)
-        print("resumed checkpoint {} at epoch {}, step {}".format(resume, start_epoch, global_step))
+        if resume is not None:
+            train_state = state.get("training_state", {})
+            if train_state.get("secret_optimizer"):
+                secret_optimizer.load_state_dict(train_state["secret_optimizer"])
+            if train_state.get("full_optimizer"):
+                full_optimizer.load_state_dict(train_state["full_optimizer"])
+            if use_gan and train_state.get("discriminator"):
+                discriminator.load_state_dict(train_state["discriminator"])
+                discriminator_optimizer.load_state_dict(train_state["discriminator_optimizer"])
+            adaptive_ready_epochs = int(train_state.get("adaptive_ready_epochs", 0))
+            adaptive_start_step = train_state.get("adaptive_start_step")
+            start_epoch = int(state.get("epoch", 0))
+            global_step = int(state.get("global_step", 0))
+            best = float(state.get("best_val_loss", best))
+            _restore_rng_state(state)
+            print("resumed checkpoint {} at epoch {}, step {}".format(resume, start_epoch, global_step))
+        else:
+            print("loaded model weights from {} for fine-tuning; optimizer, epoch, step, and RNG were reset".format(finetune_from))
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

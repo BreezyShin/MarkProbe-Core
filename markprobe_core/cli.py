@@ -24,8 +24,11 @@ def main():
     train.add_argument("--no-stn", action="store_true", help="Disable the decoder spatial transformer")
     train.add_argument("--residual-scale", type=float, default=0.1)
     train.add_argument("--device", default=None)
-    train.add_argument("--resume", default=None,
-                       help="Resume training from a checkpoint; --epochs is the total target epoch count")
+    checkpoint_group = train.add_mutually_exclusive_group()
+    checkpoint_group.add_argument("--resume", default=None,
+                                  help="Resume training from a checkpoint; settings and optimizer state must match")
+    checkpoint_group.add_argument("--finetune-from", default=None,
+                                  help="Load model weights only, reset optimizer/ramp, and allow changed settings")
     train.add_argument("--limit", type=int, default=None, help="Optional image cap for a quick pipeline smoke test")
     train.add_argument("--no-lpips", action="store_true", help="Disable the StegaStamp LPIPS image objective")
     train.add_argument("--no-gan", action="store_true", help="Disable the training-only discriminator objective")
@@ -69,7 +72,8 @@ def main():
     if args.command == "train":
         train_model(args.data, args.output, epochs=args.epochs, image_size=args.image_size,
                     batch_size=args.batch_size, val_fraction=args.val_fraction, message_bits=args.message_bits,
-                    width=args.width, device=args.device, resume=args.resume, limit=args.limit,
+                    width=args.width, device=args.device, resume=args.resume,
+                    finetune_from=args.finetune_from, limit=args.limit,
                     max_steps=args.max_steps,
                     use_stn=not args.no_stn, residual_scale=args.residual_scale,
                     no_im_loss_steps=args.no_image_loss_steps,

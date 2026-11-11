@@ -272,6 +272,37 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(second_state["epoch"], 2)
             self.assertTrue(output.is_file())
 
+    def test_finetune_from_weights_resets_training_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            data_dir = root / "images"
+            data_dir.mkdir()
+            for index in range(4):
+                Image.new("RGB", (24, 24), color=(40 * index, 80, 160)).save(
+                    data_dir / "{:02d}.png".format(index)
+                )
+
+            base = root / "base.pt"
+            train_model(
+                data_dir, base, image_size=16, message_bits=8, width=32,
+                epochs=1, batch_size=2, val_fraction=0.25, device="cpu",
+                workers=0, progress=False, seed=7, lpips_weight=0.0, use_gan=False,
+                no_im_loss_steps=0,
+            )
+            source = root / "base.last.pt"
+            finetuned = root / "finetuned.pt"
+            train_model(
+                data_dir, finetuned, image_size=16, message_bits=8, width=32,
+                epochs=1, batch_size=2, val_fraction=0.25, device="cpu",
+                workers=0, progress=False, seed=11, lpips_weight=0.0, use_gan=False,
+                no_im_loss_steps=0, crop_scale_min=0.80, crop_scale_max=0.95,
+                finetune_from=source,
+            )
+            state = torch.load(root / "finetuned.last.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(state["epoch"], 1)
+            self.assertEqual(state["global_step"], 2)
+            self.assertEqual(state["training_state"]["train_config"]["crop_scale_min"], 0.80)
+
     def test_crop_resize_attack_preserves_shape_and_gradients(self):
         image = torch.rand(2, 3, 24, 24, requires_grad=True)
         attacked = crop_resize_attack(image, 0.7, 0.9)

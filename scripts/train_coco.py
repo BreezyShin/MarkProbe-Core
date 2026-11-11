@@ -32,6 +32,8 @@ MAX_STEPS = None
 BATCH_SIZE = 4
 VAL_FRACTION = 0.1
 DUAL_BRANCH = True
+CROP_SCALE_MIN = 0.65
+CROP_SCALE_MAX = 0.90
 EPOCH_EXPORT_SAMPLES = 4
 ADAPTIVE_IMAGE_LOSS = False
 ADAPTIVE_MSG_THRESHOLD = 0.30
@@ -72,7 +74,15 @@ def parse_args():
     )
     parser.add_argument("--device", default=None, help="cuda:0, cpu; defaults to CUDA when available")
     parser.add_argument("--limit", type=int, default=None, help="Optional image cap for smoke tests")
-    parser.add_argument("--resume", type=Path, default=None, help="Explicit .last.pt training checkpoint")
+    parser.add_argument("--crop-scale-min", type=float, default=CROP_SCALE_MIN,
+                        help="Minimum retained side fraction for the crop branch")
+    parser.add_argument("--crop-scale-max", type=float, default=CROP_SCALE_MAX,
+                        help="Maximum retained side fraction for the crop branch")
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument("--resume", type=Path, default=None,
+                                  help="Resume an exact training state; settings must match")
+    checkpoint_group.add_argument("--finetune-from", type=Path, default=None,
+                                  help="Load model weights only, reset optimizers/ramp, and allow changed training settings")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh even if .last.pt exists")
     return parser.parse_args()
 
@@ -108,7 +118,7 @@ def prepare_data(zip_path: Path, data_dir: Path):
     return images
 
 
-def expected_train_config():
+def expected_train_config(crop_scale_min=CROP_SCALE_MIN, crop_scale_max=CROP_SCALE_MAX):
     return {
         "batch_size": BATCH_SIZE, "lr": 1e-4, "seed": 2026,
         "val_fraction": VAL_FRACTION, "no_im_loss_steps": NO_IM_LOSS_STEPS,
@@ -121,8 +131,8 @@ def expected_train_config():
         "edge_delay_steps": EDGE_DELAY_STEPS, "edge_ramp_steps": EDGE_RAMP_STEPS,
         "gan_weight": 0.5, "gan_ramp_steps": LOSS_RAMP_STEPS,
         "use_gan": True, "use_jpeg": True, "border": "white",
-        "dual_branch": DUAL_BRANCH, "crop_scale_min": 0.65,
-        "crop_scale_max": 0.90, "adaptive_image_loss": ADAPTIVE_IMAGE_LOSS,
+        "dual_branch": DUAL_BRANCH, "crop_scale_min": crop_scale_min,
+        "crop_scale_max": crop_scale_max, "adaptive_image_loss": ADAPTIVE_IMAGE_LOSS,
         "adaptive_msg_threshold": ADAPTIVE_MSG_THRESHOLD,
         "adaptive_ber_threshold": ADAPTIVE_BER_THRESHOLD,
         "adaptive_patience": ADAPTIVE_PATIENCE,
@@ -131,7 +141,7 @@ def expected_train_config():
     }
 
 
-def select_resume(output: Path, explicit: Optional[Path], no_resume: bool):
+def select_resume(output: Path, explicit: Optional[Path], no_resume: bool, expected_config=None):
     if no_resume:
         print("Resume checkpoint: disabled")
         return None
@@ -148,7 +158,7 @@ def select_resume(output: Path, explicit: Optional[Path], no_resume: bool):
         reason = "checkpoint format is not resumable"
     elif saved_arch != arch:
         reason = f"architecture mismatch: expected {arch}, found {saved_arch}"
-    elif saved_config != expected_train_config():
+    elif saved_config != (expected_config or expected_train_config()):
         reason = "saved training settings differ from this script"
     else:
         print(f"Compatible resume checkpoint: {checkpoint.resolve()}")
@@ -157,6 +167,23 @@ def select_resume(output: Path, explicit: Optional[Path], no_resume: bool):
         raise ValueError(f"Cannot resume {checkpoint}: {reason}. Use matching settings or --no-resume.")
     print(f"Found checkpoint but {reason}; starting a fresh run (checkpoint is left untouched).")
     return None
+
+
+def select_finetune(checkpoint: Optional[Path]):
+    if checkpoint is None:
+        return None
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Fine-tune checkpoint not found: {checkpoint}")
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    arch = (MESSAGE_BITS, WIDTH, True, 0.1, IMAGE_SIZE)
+    saved_arch = (state.get("message_bits"), state.get("width"), state.get("use_stn"),
+                  state.get("residual_scale"), state.get("image_size"))
+    if state.get("format") != "markprobe-core-v6-robust-training":
+        raise ValueError(f"Cannot fine-tune from {checkpoint}: checkpoint format is not supported")
+    if saved_arch != arch:
+        raise ValueError(f"Cannot fine-tune from {checkpoint}: architecture mismatch; expected {arch}, found {saved_arch}")
+    print(f"Fine-tune source: {checkpoint.resolve()} (weights only; optimizer will be reset)")
+    return checkpoint
 
 
 def main():
@@ -175,12 +202,26 @@ def main():
     else:
         print(f"Training device: {device} (full COCO training will be slow)")
 
-    resume = select_resume(args.output, args.resume, args.no_resume)
+    if args.no_resume and args.finetune_from is not None:
+        raise ValueError("--no-resume cannot be combined with --finetune-from")
+    resume = select_resume(args.output, args.resume,
+                           args.no_resume or args.finetune_from is not None,
+                           expected_train_config(args.crop_scale_min, args.crop_scale_max))
+    finetune_from = select_finetune(args.finetune_from)
+    if finetune_from is not None:
+        source = finetune_from.resolve()
+        output = args.output.resolve()
+        latest = args.output.with_name(args.output.stem + ".last" + args.output.suffix).resolve()
+        if source in {output, latest}:
+            raise ValueError(
+                "Fine-tuning would overwrite its source checkpoint. Pass a new --output path, "
+                "for example runs/markprobe_core_finetune.pt."
+            )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.metrics.parent.mkdir(parents=True, exist_ok=True)
     print("Stage 2/2: training MarkProbe-Core")
     print(f"Training config: image_size={IMAGE_SIZE}, width={WIDTH}, message_bits={MESSAGE_BITS}, "
-          f"STN=True, dual_branch={DUAL_BRANCH}, epochs={args.epochs}, "
+        f"STN=True, dual_branch={DUAL_BRANCH}, crop={args.crop_scale_min:.2f}-{args.crop_scale_max:.2f}, epochs={args.epochs}, "
           f"max_steps={max_steps}, batch_size={BATCH_SIZE}")
     print(f"Best checkpoint: {args.output.resolve()}")
     print(f"Metrics log: {args.metrics.resolve()}")
@@ -191,6 +232,7 @@ def main():
         args.data, args.output, image_size=IMAGE_SIZE, message_bits=MESSAGE_BITS,
         width=WIDTH, epochs=args.epochs, max_steps=max_steps, batch_size=BATCH_SIZE,
         limit=args.limit, val_fraction=VAL_FRACTION, device=device, resume=resume,
+        finetune_from=finetune_from,
         use_stn=True, residual_scale=0.1, no_im_loss_steps=NO_IM_LOSS_STEPS,
         image_weight=2.0, l2_loss_ramp_steps=LOSS_RAMP_STEPS,
         lpips_loss_ramp_steps=LOSS_RAMP_STEPS,
@@ -200,7 +242,7 @@ def main():
         secret_loss_scale=1.5, secret_loss_ramp_steps=1,
         gan_weight=0.5, gan_ramp_steps=LOSS_RAMP_STEPS, use_gan=True,
         use_jpeg=True, border="white", dual_branch=DUAL_BRANCH,
-        crop_scale_min=0.65, crop_scale_max=0.90,
+        crop_scale_min=args.crop_scale_min, crop_scale_max=args.crop_scale_max,
         adaptive_image_loss=ADAPTIVE_IMAGE_LOSS,
         adaptive_msg_threshold=ADAPTIVE_MSG_THRESHOLD,
         adaptive_ber_threshold=ADAPTIVE_BER_THRESHOLD,
